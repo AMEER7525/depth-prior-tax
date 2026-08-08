@@ -1,0 +1,13 @@
+torch
+torchvision
+numpy
+scipy
+pyyaml
+opencv-python
+imageio
+lpips
+matplotlib
+tqdm
+# The original 3DGS repo has its own CUDA-compiled submodules
+# (diff-gaussian-rasterization, simple-knn). Install those per its own README
+# inside third_party/3dgs, pinned to your CUDA / torch build.
