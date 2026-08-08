@@ -1,0 +1,9 @@
+# Grid expanded by scripts/run_sweep.py (Cartesian product of all axes).
+# Keep the scene list small for the full grid to stay within the 4080/Colab budget.
+axes:
+  init:         [sfm, random, depth]
+  n_views:      [3, 5, 9]
+  depth_kind:   [ssi, absolute]
+  depth_lambda: [0.0, 0.05, 0.1, 0.5]
+
+scenes: [lego, chair, ship]

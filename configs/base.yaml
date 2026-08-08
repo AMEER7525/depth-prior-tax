@@ -1,0 +1,22 @@
+# Single-run configuration.
+dataset: blender            # blender | dtu
+scene: lego
+n_views: 3                  # 3 | 5 | 9 | -1 (full)
+
+init: depth                 # sfm | random | depth
+
+depth:
+  model: depth_anything_v2  # gt | depth_anything_v2 | vggt
+  # Axis C degradation (applied to GT depth; ignored for a real model)
+  sigma_rel: 0.0            # relative Gaussian-noise std
+  scale: 1.0               # affine scale bias
+  shift: 0.0               # affine shift bias
+
+loss:
+  rgb_weight: 1.0
+  depth_kind: ssi           # ssi | pearson | absolute
+  depth_lambda: 0.1
+
+train:
+  iterations: 7000
+  seed: 0
