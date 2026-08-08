@@ -6,3 +6,4 @@ runs/
 data/
 third_party/3dgs/*
 !third_party/3dgs/README.md
+.DS_Store
