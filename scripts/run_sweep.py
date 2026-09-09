@@ -1,9 +1,9 @@
 """Expand a staged sweep into runs and launch them, with resume.
 
-Designed for the 4080-primary / Colab-overflow split: runs are addressed by a
-stable id, so both hosts can write into the same runs/ tree (synced or mounted)
-and --resume makes either host skip what the other already finished. Use
---shard i/n to split the grid across the two.
+Colab is the compute host. Runs are addressed by a stable id, so --resume
+skips whatever a previous session already finished -- the normal case after
+Colab reclaims the VM mid-stage. Use --shard i/n to split one stage across
+several concurrent sessions.
 """
 from __future__ import annotations
 
@@ -37,7 +37,7 @@ def parse_args():
     p.add_argument("--resume", action="store_true",
                    help="skip runs whose output dir already holds metrics.json")
     p.add_argument("--shard", default=None, metavar="i/n",
-                   help="run only shard i of n (e.g. 0/2 on the 4080, 1/2 on Colab)")
+                   help="run only shard i of n, to split a stage across sessions/hosts")
     return p.parse_args()
 
 

@@ -1,8 +1,9 @@
 """Dataset loading and sparse-view splits for DTU and NeRF-Synthetic.
 
-Host-agnostic: the dataset root is resolved from $DATA_ROOT (set differently on
-the 4080 box and on Colab), falling back to ./data. Nothing else in the codebase
-should hard-code a dataset path.
+Host-agnostic: the dataset root is resolved from $DATA_ROOT, falling back to
+./data. On Colab this points at local disk (/content/data), not the Drive mount
+-- see the README on why extracted data must not live on FUSE. Nothing else in
+the codebase should hard-code a dataset path.
 
 Both loaders return a `Scene`: a list of `View`s plus whatever ground-truth
 geometry that dataset provides. Everything downstream (init, depth loss,
