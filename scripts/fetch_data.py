@@ -19,6 +19,7 @@ from __future__ import annotations
 import argparse
 import shutil
 import sys
+import time
 import urllib.request
 import zipfile
 from pathlib import Path
@@ -55,15 +56,23 @@ def download(url, dest, quiet=False):
     if have and not quiet:
         print(f"  resume {dest.name} from {human(have)}")
     req = urllib.request.Request(url, headers=headers)
+    start, last = time.monotonic(), 0.0
     with urllib.request.urlopen(req, timeout=120) as r, \
             open(dest, "ab" if have else "wb") as f:
         got = have
         while chunk := r.read(1 << 20):
             f.write(chunk)
             got += len(chunk)
-            if not quiet and total:
-                pct = 100 * got / total
-                print(f"\r  {dest.name}  {pct:5.1f}%  {human(got)}/{human(total)}",
+            now = time.monotonic()
+            # Speed and ETA matter here: on a slow home link these archives take
+            # hours, and a bare percentage gives no way to decide whether to wait.
+            if not quiet and total and (now - last > 0.5 or got == total):
+                last = now
+                rate = (got - have) / max(now - start, 1e-6)
+                eta = (total - got) / rate if rate > 0 else 0
+                print(f"\r  {dest.name}  {100 * got / total:5.1f}%  "
+                      f"{human(got)}/{human(total)}  "
+                      f"{rate / 1e6:5.2f} MB/s  ETA {int(eta) // 60:3d}m{int(eta) % 60:02d}s",
                       end="", flush=True)
     if not quiet:
         print()
