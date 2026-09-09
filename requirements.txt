@@ -1,3 +1,6 @@
+# Base dependencies -- install everywhere, including the Mac.
+# Everything here runs on CPU/MPS: data loading, splits, depth corruption,
+# metrics, and the analysis notebook. No CUDA required.
 torch
 torchvision
 numpy
@@ -8,6 +11,4 @@ imageio
 lpips
 matplotlib
 tqdm
-# The original 3DGS repo has its own CUDA-compiled submodules
-# (diff-gaussian-rasterization, simple-knn). Install those per its own README
-# inside third_party/3dgs, pinned to your CUDA / torch build.
+pytest
