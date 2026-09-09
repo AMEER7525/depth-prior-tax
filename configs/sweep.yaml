@@ -1,9 +1,68 @@
-# Grid expanded by scripts/run_sweep.py (Cartesian product of all axes).
-# Keep the scene list small for the full grid to stay within the 4080/Colab budget.
-axes:
-  init:         [sfm, random, depth]
-  n_views:      [3, 5, 9]
-  depth_kind:   [ssi, absolute]
-  depth_lambda: [0.0, 0.05, 0.1, 0.5]
+# Staged grid. Each stage FIXES the winner of the previous one, per the
+# proposal's "fix the best init from Week 3 before the Week 4 depth-quality
+# grid". A full Cartesian product over all four axes is ~550 runs (~140-275
+# GPU-hours); staged it is ~140 runs (~35-70), which fits weeks 3-5.
+#
+# Cells that provably cannot produce an independent result are pruned by
+# src/sweep.py -- run with --explain-pruning to see what was dropped.
 
-scenes: [lego, chair, ship]
+# ---- Stage 1: Axis A x B. Which initialization, at which view count? -------
+# No depth loss anywhere, so this isolates initialization. 3*3*3 = 27 runs.
+stage1:
+  axes:
+    init:         [sfm, random, depth]
+    n_views:      [3, 5, 9]
+    depth_lambda: [0.0]
+  scenes: [lego, chair, ship]
+
+# ---- Stage 2: the lambda x loss-kind sweep, at stage1's winning init -------
+# Finds where depth flips from help to harm. 2*3*3*3 = 54 runs.
+stage2:
+  axes:
+    init:         [depth]          # <- set to the stage1 winner
+    n_views:      [3, 9]
+    depth_kind:   [ssi, pearson, absolute]
+    depth_lambda: [0.05, 0.1, 0.5]
+  scenes: [lego, chair, ship]
+
+# ---- Stage 3: Axis C, the controlled degradation curve ---------------------
+# Two arms swept SEPARATELY, not as a product -- they probe different failure
+# modes and a noise x affine grid buys nothing. Set init/depth_lambda to the
+# stage1/stage2 winners before launching.
+#
+# 3a: additive noise. Every loss can see this one.
+stage3_noise:
+  axes:
+    init:         [depth]
+    n_views:      [3, 9]
+    depth_kind:   [ssi, absolute]
+    depth_lambda: [0.1]            # <- set to the stage2 winner
+    sigma_rel:    [0.05, 0.1, 0.2, 0.4]
+  scenes: [lego, chair]
+
+# 3b: affine scale bias -- the monocular failure mode. With init=depth the bias
+# reaches geometry through backprojection even when the loss is blind to it,
+# which is exactly the appearance-vs-geometry split the project is hunting.
+stage3_affine:
+  axes:
+    init:         [depth]
+    n_views:      [3, 9]
+    depth_kind:   [ssi, absolute]
+    depth_lambda: [0.1]            # <- set to the stage2 winner
+    scale:        [1.25, 1.5, 2.0]
+    shift:        [0.0]
+  scenes: [lego, chair]
+
+# ---- Stage 4: where does a REAL monocular model land on that curve? --------
+# The proposal's "one real operating point". Runs the same cells as stage3 but
+# with a real predictor instead of perturbed GT, so its appearance/geometry
+# result can be plotted against the stage3 degradation curve. No corruption
+# knobs here -- there is no GT to perturb.
+stage4_real:
+  axes:
+    init:         [depth]
+    n_views:      [3, 9]
+    depth_kind:   [ssi, absolute]
+    depth_lambda: [0.1]            # <- match stage3
+    depth_model:  [depth_anything_v2]
+  scenes: [lego, chair]
