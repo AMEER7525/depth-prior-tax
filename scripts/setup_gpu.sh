@@ -1,5 +1,5 @@
 #!/usr/bin/env bash
-# Set up the GPU host (4080 box or Colab). Verifies CUDA before installing
+# Set up the GPU host (Colab). Verifies CUDA before installing
 # gsplat, because a CUDA-less failure from pip is deeply unhelpful.
 set -euo pipefail
 cd "$(dirname "$0")/.."
@@ -48,5 +48,5 @@ cat <<'EOF'
 Next:
   export DATA_ROOT=/path/to/data RUNS_ROOT=/path/to/runs
   python scripts/run_sweep.py --sweep configs/sweep.yaml --stage stage1 --resume
-Split across hosts with --shard 0/2 (4080) and --shard 1/2 (Colab).
+Split a stage across sessions with --shard 0/2 and --shard 1/2.
 EOF
