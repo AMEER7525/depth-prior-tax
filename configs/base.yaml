@@ -6,7 +6,11 @@ n_views: 3                  # 3 | 5 | 9 | -1 (full)
 init: depth                 # sfm | random | depth
 
 depth:
-  model: depth_anything_v2  # gt | depth_anything_v2 | vggt
+  # 'gt' is the DEFAULT because the controlled-degradation study (Axis C)
+  # perturbs ground-truth depth. A real model has no GT to perturb, so the
+  # sigma_rel/scale/shift knobs below do nothing unless this is 'gt'.
+  # Switch to a real model only for the week-5 operating-point runs.
+  model: gt                 # gt | depth_anything_v2 | vggt
   # Axis C degradation (applied to GT depth; ignored for a real model)
   sigma_rel: 0.0            # relative Gaussian-noise std
   scale: 1.0               # affine scale bias
