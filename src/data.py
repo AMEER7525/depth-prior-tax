@@ -40,6 +40,28 @@ BLENDER_SCENES = ["chair", "drums", "ficus", "hotdog", "lego", "materials",
                   "mic", "ship"]
 
 
+def blender_sparse_split(n_views, n_total=100):
+    """Input view ids for an n-view NeRF-Synthetic experiment.
+
+    Evenly spaced over the 100 training poses, which orbit the object, so any
+    n gives roughly uniform azimuthal coverage. Deterministic, so a run is
+    reproducible from its config alone.
+
+    Unlike the DTU ids above this is OURS -- Blender sparse-view papers do not
+    share one protocol, so these numbers are comparable across our own arms and
+    to nothing published.
+    """
+    if not 1 <= n_views <= n_total:
+        raise ValueError(f"n_views={n_views} outside 1..{n_total}")
+    return [int(round(i)) for i in np.linspace(0, n_total, n_views, endpoint=False)]
+
+
+def evenly_spaced(n_pick, n_total):
+    """Deterministic subsample of held-out views, to keep evaluation affordable."""
+    n_pick = min(n_pick, n_total)
+    return [int(round(i)) for i in np.linspace(0, n_total, n_pick, endpoint=False)]
+
+
 def resolve_data_root(root=None):
     """Dataset root: explicit arg > $DATA_ROOT > ./data."""
     if root is not None:
