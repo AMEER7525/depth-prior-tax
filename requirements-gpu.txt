@@ -9,5 +9,6 @@ gsplat
 # Depth Anything V2 for the real-monocular-model operating point (week 5).
 # Runs on MPS too, so depth maps can be precomputed on the Mac.
 timm
+transformers
 huggingface_hub
 safetensors

@@ -176,3 +176,54 @@ def test_noise_scales_with_sigma_rel(depths):
         for s in (0.01, 0.1, 0.5)
     ]
     assert spreads[0] < spreads[1] < spreads[2]
+
+
+# --------------------------------------------------------------------------
+# Depth Anything V2 output semantics (stage4_real)
+# --------------------------------------------------------------------------
+def test_alignment_recovers_a_known_scale_and_shift():
+    """align_to_metric must report the (s,t) it solved, not just the result.
+
+    Those two numbers are how far the real model sits from correct scale, which
+    is what places it on the Axis C degradation curve. Losing them would make
+    the real operating point unplottable.
+    """
+    from src.depth_model import align_to_metric
+    rng = np.random.default_rng(0)
+    metric = rng.uniform(1.0, 5.0, size=(16, 16))
+    pred = (metric - 0.7) / 3.0                      # a known affine distortion
+
+    aligned, s, t = align_to_metric(pred, metric)
+    assert s == pytest.approx(3.0, rel=1e-6)
+    assert t == pytest.approx(0.7, rel=1e-6)
+    assert np.allclose(aligned, metric, atol=1e-9)
+
+
+def test_alignment_honours_a_mask_and_ignores_invalid_reference():
+    from src.depth_model import align_to_metric
+    rng = np.random.default_rng(1)
+    metric = rng.uniform(1.0, 5.0, size=(16, 16))
+    pred = 0.5 * metric + 0.2
+    # Background: zero reference depth, and prediction poisoned with nonsense.
+    metric[:4] = 0.0
+    pred[:4] = 1e6
+    aligned, s, t = align_to_metric(pred, metric)
+    assert s == pytest.approx(2.0, rel=1e-6)
+    assert t == pytest.approx(-0.4, rel=1e-6)
+
+
+def test_disparity_inverts_monotonically():
+    """Near objects have LARGE disparity and SMALL depth."""
+    from src.depth_model import disparity_to_depth
+    disp = np.array([[10.0, 1.0], [0.1, 0.01]])
+    depth = disparity_to_depth(disp)
+    assert depth[0, 0] < depth[0, 1] < depth[1, 0] < depth[1, 1]
+    assert np.isfinite(disparity_to_depth(np.zeros((2, 2)))).all()
+
+
+def test_alignment_rejects_degenerate_input():
+    from src.depth_model import align_to_metric
+    with pytest.raises(ValueError):
+        align_to_metric(np.ones((8, 8)), np.zeros((8, 8)))       # no valid ref
+    with pytest.raises(ValueError):
+        align_to_metric(np.ones((8, 8)), np.ones((4, 4)))        # shape mismatch

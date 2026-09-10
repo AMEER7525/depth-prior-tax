@@ -120,6 +120,28 @@ prior is applied to the *input* views, which have no depth at all. So Axis C
 still requires re-rendering metric depth from the original `.blend` files into
 `depth_<split>/r_<i>.npy`. This remains the critical path.
 
+### Depth model — Depth Anything V2
+Fetched by `scripts/fetch_model.py`; wrapped by `src/depth_model.py`.
+
+```bash
+python scripts/fetch_model.py --variant large --dest <dir>   # 99 / 390 / 1341 MB
+```
+
+Needed **only for `stage4_real`**. Axis C perturbs ground-truth depth and uses
+no model, so this is off the critical path.
+
+**What it outputs matters more here than usual.** DAv2 predicts *relative
+inverse depth*, defined only up to scale and shift — it is not metric. That
+ambiguity is the phenomenon this project studies, so the code refuses to hide
+it:
+
+- As a **loss target**, feed the raw prediction to a scale-invariant loss.
+  Passing it to the absolute loss compares disparity against metres.
+- As an **init source**, backprojection needs metric depth, so the raw
+  prediction backprojects to garbage. `align_to_metric()` fits it to something
+  with real scale and **returns the `(scale, shift)` it solved** — log those:
+  they are what places the real model on the Axis C degradation curve.
+
 ### DTU — not yet sourced
 The route the sparse-view papers use (DNGaussian, FSGS) starts from DTU
 **Rectified, 123 GB**, plus COLMAP preprocessing to recover poses. That does
