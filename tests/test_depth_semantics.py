@@ -135,8 +135,12 @@ def test_affine_bias_displaces_the_backprojected_cloud():
 
 
 def test_backprojection_roundtrips_through_a_known_camera():
-    """A pixel at the principal point at depth d must land at distance d ahead."""
-    K = np.array([[100.0, 0, 16.0], [0, 100.0, 16.0], [0, 0, 1.0]])
+    """A pixel at the principal point at depth d must land at distance d ahead.
+
+    Pixel centres sit at +0.5 (gsplat's convention), so in a 33-pixel image
+    the centre pixel 16 is at 16.5 -- which is where the principal point goes.
+    """
+    K = np.array([[100.0, 0, 16.5], [0, 100.0, 16.5], [0, 0, 1.0]])
     pts = backproject_depth(np.full((33, 33), 2.0), K, np.eye(4))
     centre = pts[np.argmin(np.linalg.norm(pts[:, :2], axis=1))]
     assert centre == pytest.approx([0.0, 0.0, 2.0], abs=1e-6)

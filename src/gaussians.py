@@ -7,6 +7,9 @@ The rasterizer is isolated in src/render.py.
 Parameter conventions follow what gsplat's strategies require: a ParameterDict
 with "means", "scales", "quats", "opacities", stored in their raw
 (pre-activation) form -- log scales, logit opacities, unnormalized quaternions.
+Colour is stored as spherical-harmonic coefficients exactly as vanilla 3DGS
+stores it ("sh0" is the DC term; "shN" the higher bands when sh_degree > 0), so
+the rasterizer's colour path, including its clamp_min(0), is the reference one.
 """
 from __future__ import annotations
 
@@ -14,9 +17,38 @@ import numpy as np
 import torch
 from torch import nn
 
+SH_C0 = 0.28209479177387814
+
+
+def rgb_to_sh(rgb):
+    return (rgb - 0.5) / SH_C0
+
+
+def sh_to_rgb(sh):
+    return sh * SH_C0 + 0.5
+
 
 def _inverse_sigmoid(x):
     return float(np.log(x / (1.0 - x)))
+
+
+RESET_OPACITY = 0.01     # vanilla 3DGS caps every opacity at 0.01 on reset
+
+
+@torch.no_grad()
+def reset_opacity(params, optimizer, value=RESET_OPACITY):
+    """Vanilla 3DGS opacity reset: cap every opacity at `value`, clear its Adam state.
+
+    Gaussians the images need regain opacity within a few hundred steps;
+    floaters they do not need stay transparent and are pruned. In place, so
+    the optimizer keeps pointing at the same parameter.
+    """
+    p = params["opacities"]
+    p.clamp_(max=_inverse_sigmoid(value))
+    state = optimizer.state.get(p, {})
+    for key in ("exp_avg", "exp_avg_sq"):
+        if key in state:
+            state[key].zero_()
 
 
 def knn_scale(points, k=3, floor=1e-7):
@@ -38,13 +70,15 @@ def knn_scale(points, k=3, floor=1e-7):
 class Gaussians(nn.Module):
     """A trainable Gaussian cloud.
 
-    Colors are plain RGB (sh_degree=None at the rasterizer). The study varies
-    initialization, view count and depth supervision; adding spherical
-    harmonics would introduce a confound this project does not control for,
-    and NeRF-Synthetic objects are near-Lambertian.
+    The study's default is sh_degree=0 (view-independent colour): it varies
+    initialization, view count and depth supervision, and higher SH bands let a
+    sparse-view model fit training views with view-dependent colour instead of
+    geometry -- a confound this project does not control for. sh_degree=3
+    reproduces vanilla 3DGS for the reproduction gate.
     """
 
-    def __init__(self, means, colors, scales=None, opacity=0.1, device="cpu"):
+    def __init__(self, means, colors, scales=None, opacity=0.1, sh_degree=0,
+                 device="cpu"):
         super().__init__()
         means = torch.as_tensor(np.asarray(means), dtype=torch.float32)
         colors = torch.as_tensor(np.asarray(colors), dtype=torch.float32)
@@ -52,6 +86,8 @@ class Gaussians(nn.Module):
             raise ValueError(f"means must be (N,3), got {tuple(means.shape)}")
         if len(colors) != len(means):
             raise ValueError(f"{len(colors)} colors for {len(means)} means")
+        if not 0 <= sh_degree <= 3:
+            raise ValueError(f"sh_degree must be 0..3, got {sh_degree}")
 
         n = len(means)
         if scales is None:
@@ -63,14 +99,17 @@ class Gaussians(nn.Module):
         quats = torch.zeros(n, 4)
         quats[:, 0] = 1.0                       # wxyz identity rotation
 
-        self.params = nn.ParameterDict({
+        params = {
             "means": nn.Parameter(means),
             "scales": nn.Parameter(torch.log(scales.clamp(min=1e-8))),
             "quats": nn.Parameter(quats),
-            "opacities": nn.Parameter(
-                torch.full((n,), _inverse_sigmoid(opacity))),
-            "colors": nn.Parameter(colors.clamp(0.0, 1.0)),
-        })
+            "opacities": nn.Parameter(torch.full((n,), _inverse_sigmoid(opacity))),
+            "sh0": nn.Parameter(rgb_to_sh(colors.clamp(0.0, 1.0))[:, None, :]),
+        }
+        if sh_degree > 0:
+            params["shN"] = nn.Parameter(torch.zeros(n, (sh_degree + 1) ** 2 - 1, 3))
+        self.params = nn.ParameterDict(params)
+        self.sh_degree = sh_degree
         self.to(device)
 
     def __len__(self):
@@ -81,33 +120,50 @@ class Gaussians(nn.Module):
     @property
     def activated(self):
         p = self.params
+        sh = p["sh0"] if "shN" not in p else torch.cat([p["sh0"], p["shN"]], dim=1)
         return dict(
             means=p["means"],
             quats=p["quats"],
             scales=torch.exp(p["scales"]),
             opacities=torch.sigmoid(p["opacities"]),
-            colors=torch.clamp(p["colors"], 0.0, 1.0),
+            sh=sh,
+            rgb=torch.clamp(sh_to_rgb(p["sh0"][:, 0]), 0.0, 1.0),
         )
 
     def save_ply(self, path):
-        """Write positions and colors for the geometry metric and for viewers."""
+        """Binary PLY of centres, DC colour and opacity, for figures and viewers."""
         a = self.activated
         xyz = a["means"].detach().cpu().numpy()
-        rgb = (a["colors"].detach().cpu().numpy() * 255).astype(np.uint8)
-        with open(path, "w") as f:
-            f.write("ply\nformat ascii 1.0\n")
-            f.write(f"element vertex {len(xyz)}\n")
-            f.write("property float x\nproperty float y\nproperty float z\n")
-            f.write("property uchar red\nproperty uchar green\nproperty uchar blue\n")
-            f.write("end_header\n")
-            for (x, y, z), (r, g, b) in zip(xyz, rgb):
-                f.write(f"{x} {y} {z} {r} {g} {b}\n")
+        rgb = (a["rgb"].detach().cpu().numpy() * 255 + 0.5).astype(np.uint8)
+        op = a["opacities"].detach().cpu().numpy()
+        dt = np.dtype([("x", "<f4"), ("y", "<f4"), ("z", "<f4"),
+                       ("red", "u1"), ("green", "u1"), ("blue", "u1"),
+                       ("opacity", "<f4")])
+        arr = np.empty(len(xyz), dtype=dt)
+        arr["x"], arr["y"], arr["z"] = xyz[:, 0], xyz[:, 1], xyz[:, 2]
+        arr["red"], arr["green"], arr["blue"] = rgb[:, 0], rgb[:, 1], rgb[:, 2]
+        arr["opacity"] = op
+        header = ("ply\nformat binary_little_endian 1.0\n"
+                  f"element vertex {len(arr)}\n"
+                  "property float x\nproperty float y\nproperty float z\n"
+                  "property uchar red\nproperty uchar green\nproperty uchar blue\n"
+                  "property float opacity\nend_header\n")
+        with open(path, "wb") as f:
+            f.write(header.encode("ascii"))
+            f.write(arr.tobytes())
 
 
 # --------------------------------------------------------------------------
 # Axis A: the three initializations
 # --------------------------------------------------------------------------
-def init_random(n_points=100_000, extent=1.3, seed=0, device="cpu"):
+def _cap(pts, cols, max_points, seed):
+    if len(pts) > max_points:
+        idx = np.random.default_rng(seed).choice(len(pts), max_points, replace=False)
+        pts, cols = pts[idx], cols[idx]
+    return pts, cols
+
+
+def init_random(n_points=100_000, extent=1.3, seed=0, sh_degree=0, device="cpu"):
     """Uniform points in a cube, grey colors -- vanilla 3DGS's Blender default.
 
     NeRF-Synthetic has no SfM cloud, so the original paper initializes it
@@ -116,10 +172,11 @@ def init_random(n_points=100_000, extent=1.3, seed=0, device="cpu"):
     rng = np.random.default_rng(seed)
     means = rng.uniform(-extent, extent, size=(n_points, 3))
     colors = np.full((n_points, 3), 0.5)
-    return Gaussians(means, colors, device=device)
+    return Gaussians(means, colors, sh_degree=sh_degree, device=device)
 
 
-def init_from_depth(views, max_points=200_000, stride=2, seed=0, device="cpu"):
+def init_from_depth(views, max_points=200_000, stride=2, seed=0, sh_degree=0,
+                    device="cpu"):
     """Backproject each input view's depth into one cloud (Axis A, 'depth').
 
     Consumes METRIC depth. This is the path through which a scale-biased prior
@@ -144,40 +201,53 @@ def init_from_depth(views, max_points=200_000, stride=2, seed=0, device="cpu"):
     cols = np.concatenate(all_cols, axis=0)
     if len(pts) == 0:
         raise ValueError("depth init produced no points (all depth invalid?)")
-    if len(pts) > max_points:
-        idx = np.random.default_rng(seed).choice(len(pts), max_points, replace=False)
-        pts, cols = pts[idx], cols[idx]
-    return Gaussians(pts, cols, device=device)
+    pts, cols = _cap(pts, cols, max_points, seed)
+    return Gaussians(pts, cols, sh_degree=sh_degree, device=device)
 
 
-def init_from_sfm(points_path, max_points=200_000, seed=0, device="cpu"):
-    """Initialize from a COLMAP/SfM cloud (Axis A, 'sfm')."""
-    from pathlib import Path
-    from src.data import _load_ply_points
-
-    p = Path(points_path)
-    if not p.exists():
-        raise FileNotFoundError(
-            f"no SfM point cloud at {p}.\n"
-            "NeRF-Synthetic ships none -- COLMAP must be run over the selected\n"
-            "input views first. The original 3DGS paper uses RANDOM init for\n"
-            "Blender scenes for exactly this reason, so on this dataset\n"
-            "init=random is the meaningful baseline, not init=sfm.")
-    pts = _load_ply_points(p)
-    if len(pts) > max_points:
-        idx = np.random.default_rng(seed).choice(len(pts), max_points, replace=False)
-        pts = pts[idx]
-    return Gaussians(pts, np.full((len(pts), 3), 0.5), device=device)
+def init_from_points(points, colors, max_points=200_000, seed=0, sh_degree=0,
+                     device="cpu"):
+    """Initialize from a sparse SfM cloud (Axis A, 'sfm')."""
+    pts = np.asarray(points, dtype=np.float64)
+    cols = np.asarray(colors, dtype=np.float64)
+    pts, cols = _cap(pts, cols, max_points, seed)
+    return Gaussians(pts, cols, sh_degree=sh_degree, device=device)
 
 
-def build_initial_gaussians(cfg, views, device="cpu", sfm_path=None):
-    """Dispatch on cfg['init']."""
+def build_initial_gaussians(cfg, views, device="cpu", sfm=None):
+    """Dispatch on cfg['init']. Returns (gaussians, init_info).
+
+    `sfm` is a precomputed (points, colors, stats) from src.sfm.triangulate_views,
+    passed in when the caller already triangulated (e.g. to align a real depth
+    model against the same points); otherwise it is computed here.
+    """
     kind = cfg.get("init", "random")
-    seed = cfg.get("train", {}).get("seed", 0)
+    io = cfg.get("init_opts") or {}
+    tcfg = cfg.get("train") or {}
+    seed, sh = tcfg.get("seed", 0), tcfg.get("sh_degree", 0)
+    max_points = io.get("max_points", 200_000)
+
     if kind == "random":
-        return init_random(seed=seed, device=device)
+        g = init_random(io.get("random_points", 100_000), io.get("random_extent", 1.3),
+                        seed=seed, sh_degree=sh, device=device)
+        return g, {"init": kind, "n_init_points": len(g)}
     if kind == "depth":
-        return init_from_depth(views, seed=seed, device=device)
+        g = init_from_depth(views, max_points=max_points,
+                            stride=io.get("depth_stride", 2), seed=seed,
+                            sh_degree=sh, device=device)
+        return g, {"init": kind, "n_init_points": len(g)}
     if kind == "sfm":
-        return init_from_sfm(sfm_path, seed=seed, device=device)
+        if sfm is None:
+            from src.sfm import triangulate_views
+            sfm = triangulate_views(views, **(cfg.get("sfm") or {}))
+        pts, cols, stats = sfm
+        min_pts = io.get("sfm_min_points", 4)
+        if len(pts) < min_pts:
+            raise ValueError(
+                f"SfM triangulated {len(pts)} point(s) from {len(views)} views "
+                f"(need >= {min_pts}); init=sfm cannot start. With few views "
+                "this is the expected failure of SfM, and is itself a result.")
+        g = init_from_points(pts, cols, max_points, seed, sh, device)
+        public = {k: v for k, v in stats.items() if not k.startswith("_")}
+        return g, {"init": kind, "n_init_points": len(g), "sfm": public}
     raise ValueError(f"unknown init {kind!r}; expected sfm | random | depth")

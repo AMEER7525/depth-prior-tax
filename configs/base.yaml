@@ -1,26 +1,67 @@
-# Single-run configuration.
+# Single-run configuration. Sweep cells (configs/sweep.yaml) override keys here.
 dataset: blender            # blender | dtu
-scene: lego
-n_views: 3                  # 3 | 5 | 9 | -1 (full)
+scene: lego                 # a NeRF-Synthetic scene, or scan1 / scan6 for DTU
+n_views: 3                  # 3 | 5 | 9 | -1 (every training view)
+split: fps                  # blender view selection: fps (ours; nested prefixes)
+                            # | dietnerf (the published 8-view split) | even
+eval_views: 25              # every 8th of the 200 test views (DietNeRF protocol);
+                            # DTU always uses its 25-view RegNeRF test split
+downscale: 2                # 800 -> 400 px, the sparse-view Blender protocol.
+                            # DTU is prepared at 400x300 already: use 1
+background: white           # white for NeRF-Synthetic (every published number
+                            # uses it); black for DTU
 
 init: depth                 # sfm | random | depth
+init_opts:
+  random_points: 100000     # vanilla 3DGS Blender init: 100k points in a cube
+  random_extent: 1.3
+  depth_stride: 2           # backprojection pixel stride
+  max_points: 200000
+  sfm_min_points: 4         # fewer triangulated points than this = SfM failed
+
+sfm:                        # known-pose triangulation, src/sfm.py
+  full_res: true            # detect on the native 800 px Blender images
+  max_features: 20000
+  ratio: 0.9                # looser than COLMAP's 0.8: matches must also pass
+                            # the known-pose epipolar check
+  max_epipolar_px: 2.0
+  max_reproj_px: 2.0
+  min_angle_deg: 1.0
 
 depth:
   # 'gt' is the DEFAULT because the controlled-degradation study (Axis C)
   # perturbs ground-truth depth. A real model has no GT to perturb, so the
-  # sigma_rel/scale/shift knobs below do nothing unless this is 'gt'.
-  # Switch to a real model only for the week-5 operating-point runs.
-  model: gt                 # gt | depth_anything_v2 | vggt
-  # Axis C degradation (applied to GT depth; ignored for a real model)
-  sigma_rel: 0.0            # relative Gaussian-noise std
-  scale: 1.0               # affine scale bias
-  shift: 0.0               # affine shift bias
+  # corruption knobs below do nothing unless this is 'gt' (run_sweep refuses
+  # such cells rather than let them produce a flat curve).
+  model: gt                 # gt | depth_anything_v2
+  # Axis C degradation (applied to GT depth only)
+  sigma_rel: 0.0            # noise std, relative to the median valid depth
+  noise_corr_px: 0.0        # 0 = i.i.d. per pixel; >0 = Gaussian-smoothed noise
+  scale: 1.0                # global affine scale bias
+  shift: 0.0                # global affine shift bias (scene units)
+  scale_jitter: 0.0         # per-image log-normal scale spread
+  shift_jitter: 0.0         # per-image shift spread, relative to median depth
+  # Real model only
+  variant: large            # small | base | large
+  local_dir: null           # weights on disk (scripts/fetch_model.py); null = Hub
+  align: gt                 # gt (per-image oracle) | sfm (to triangulated points)
+                            # | none (relative; scale-invariant losses only)
 
 loss:
   rgb_weight: 1.0
   depth_kind: ssi           # ssi | pearson | absolute
   depth_lambda: 0.1
+  alpha_weight: 0.0         # L1(rendered alpha, mask); used by make_gt_depth.py
 
 train:
   iterations: 7000
   seed: 0
+  means_lr_steps: null      # means-lr decay horizon; null = the run (vanilla: 30000)
+  sh_degree: 0              # 0 for the study (see src/gaussians.py); 3 = vanilla
+  densify_from: 500
+  densify_until: 0.5        # fraction of iterations; vanilla 3DGS: 15k of 30k
+  densify_every: 100
+  reset_every: 3000
+  probe_every: 500          # convergence curve on 4 held-out views
+
+save_ply: false             # write points.ply (~6 MB/run) for figures

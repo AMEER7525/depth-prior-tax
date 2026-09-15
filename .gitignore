@@ -4,6 +4,16 @@ runs/
 *.csv
 *.ply
 data/
-third_party/3dgs/*
-!third_party/3dgs/README.md
 .DS_Store
+# LaTeX build products (report/report.pdf itself is committed)
+report/*.aux
+report/*.log
+report/*.fls
+report/*.fdb_latexmk
+report/*.out
+# the results snapshot the report is built from is committed
+!results/*.csv
+.pytest_cache/
+.ruff_cache/
+# exact Blender depth renders, regenerable (docs/data.md)
+exact_depth/
