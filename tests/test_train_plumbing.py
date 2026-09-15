@@ -5,7 +5,6 @@ is isolated in src/render.py and substituted here. Everything around it -- pose
 conversion, loss assembly, the optimizer/strategy handshake, evaluation, the
 metrics.json contract -- is ordinary code and is tested like ordinary code.
 """
-import json
 import sys
 from pathlib import Path
 
@@ -41,7 +40,8 @@ class FakeRasterizer:
                  width, height, render_mode, sh_degree=None, **kw):
         self.calls.append(dict(viewmats=viewmats, Ks=Ks, width=width,
                                height=height, render_mode=render_mode,
-                               n=len(means)))
+                               n=len(means), sh_degree=sh_degree,
+                               packed=kw.get("packed")))
         C = viewmats.shape[0]
         # Depend on every parameter so gradients actually flow to all of them.
         seed = (means.mean() + scales.mean() + quats.mean()
@@ -61,8 +61,9 @@ class FakeStrategy:
     def step_pre_backward(self, params, optimizers, state, step, info):
         self.pre += 1
 
-    def step_post_backward(self, params, optimizers, state, step, info):
+    def step_post_backward(self, params, optimizers, state, step, info, **kw):
         self.post += 1
+        self.post_kwargs = kw
 
 
 # --------------------------------------------------------------------------
@@ -183,13 +184,13 @@ def test_evaluate_writes_renders_and_reports_both_metric_families(tmp_path):
 # --------------------------------------------------------------------------
 # Failure modes must be actionable, not cryptic
 # --------------------------------------------------------------------------
-def test_gt_depth_missing_explains_the_blender_render_step():
+def test_gt_depth_missing_explains_how_to_build_it():
     import train as train_mod
     with pytest.raises(SystemExit) as e:
         train_mod.attach_depth(_cfg(loss={"depth_lambda": 0.1}),
                                [make_view(with_depth=False)], "cpu")
     msg = str(e.value)
-    assert ".blend" in msg and "depth_train" in msg
+    assert "make_gt_depth.py" in msg and "depth_train" in msg
 
 
 def test_depth_init_without_depth_names_the_offending_view():
@@ -244,3 +245,99 @@ def test_depth_still_required_when_init_uses_it():
     with pytest.raises(SystemExit):
         train_mod.attach_depth(_cfg(init="depth", loss={"depth_lambda": 0.0}),
                                [make_view(with_depth=False)], "cpu")
+
+
+# --------------------------------------------------------------------------
+# The training schedule
+# --------------------------------------------------------------------------
+def test_strategy_is_told_the_same_packing_the_rasterizer_used(tmp_path):
+    """gsplat defaults to packed=True, DefaultStrategy to packed=False.
+
+    Left at their defaults, the strategy reads packed [nnz] tensors as [C, N]
+    and densification accumulates gradients onto the wrong Gaussians.
+    """
+    import train as train_mod
+    from src.render import PACKED
+    fake, strat = FakeRasterizer(), FakeStrategy()
+    train_mod.train(_cfg(train={"iterations": 2}), init_random(16, seed=0),
+                    [make_view()], "cpu", tmp_path, fake, strat)
+    assert all(c["packed"] == PACKED for c in fake.calls)
+    assert strat.post_kwargs["packed"] == PACKED
+
+
+def test_means_learning_rate_decays_to_one_percent(tmp_path):
+    """Vanilla 3DGS: 1.6e-4 * extent at the start, 1.6e-6 * extent at the end."""
+    import train as train_mod
+    stats = train_mod.train(_cfg(train={"iterations": 10}), init_random(16, seed=0),
+                            [make_view()], "cpu", tmp_path, FakeRasterizer(),
+                            FakeStrategy())
+    start = train_mod.LR["means"] * stats["scene_scale"]
+    assert stats["means_lr_final"] == pytest.approx(0.01 * start, rel=1e-3)
+
+
+def test_sh_degree_rises_one_band_per_thousand_steps(tmp_path):
+    import train as train_mod
+    g = Gaussians(np.random.default_rng(0).normal(size=(16, 3)), np.full((16, 3), 0.5),
+                  sh_degree=2)
+    fake = FakeRasterizer()
+    train_mod.train(_cfg(train={"iterations": 2500}), g, [make_view(h=4, w=4)], "cpu",
+                    tmp_path, fake, FakeStrategy())
+    degs = [c["sh_degree"] for c in fake.calls]
+    assert degs[0] == 0 and degs[1500] == 1 and degs[-1] == 2
+
+
+def test_probe_views_produce_a_convergence_curve(tmp_path):
+    import train as train_mod
+    stats = train_mod.train(_cfg(train={"iterations": 4, "probe_every": 2}),
+                            init_random(16, seed=0), [make_view()], "cpu", tmp_path,
+                            FakeRasterizer(), FakeStrategy(), probe_views=[make_view()])
+    assert [s for s, _ in stats["psnr_curve"]] == [2, 4]
+
+
+def test_prior_error_is_zero_for_clean_gt_and_tracks_a_scale_bias():
+    import train as train_mod
+    v = make_view()
+    clean = train_mod.attach_depth(_cfg(init="depth", loss={"depth_lambda": 0.0}),
+                                   [v], "cpu")
+    assert clean["prior_absrel"] == pytest.approx(0.0, abs=1e-7)
+    biased = train_mod.attach_depth(
+        _cfg(init="depth", loss={"depth_lambda": 0.0}, depth={"scale": 1.5}),
+        [make_view()], "cpu")
+    assert biased["prior_absrel"] == pytest.approx(0.5, rel=1e-5)
+    # a pure affine bias is invisible once the best affine is removed
+    assert biased["prior_aligned_absrel"] == pytest.approx(0.0, abs=1e-6)
+
+
+def test_opacity_is_reset_on_vanillas_schedule(tmp_path):
+    """gsplat 1.5.3 never resets opacity (its test `step % n == 0 & step > 0`
+    is always False), so train.py does: every reset_every steps while
+    densifying, plus once at densify_from on a white background."""
+    import train as train_mod
+
+    def resets(**tr):
+        g = init_random(16, seed=0)
+        cfg = _cfg(background=tr.pop("bg", "white"),
+                   train={"iterations": 11, "reset_every": 5, "densify_from": 3, **tr})
+        stats = train_mod.train(cfg, g, [make_view()], "cpu", tmp_path,
+                                FakeRasterizer(), FakeStrategy())
+        return stats["opacity_resets"], g
+
+    got, g = resets(densify_until=1.0)
+    assert got == [3, 5, 10]
+    assert (torch.sigmoid(g.params["opacities"]) <= 0.01 + 1e-6).all()
+    assert resets(densify_until=1.0, bg="black")[0] == [5, 10]
+    assert resets(densify_until=0.5)[0] == [3]        # none once densifying stops
+
+
+def test_reset_opacity_caps_values_and_clears_adam_state():
+    from src.gaussians import reset_opacity
+    g = init_random(8, seed=0)
+    opt = torch.optim.Adam([g.params["opacities"]], lr=0.1)
+    g.params["opacities"].data.fill_(3.0)
+    g.params["opacities"].sum().backward()
+    opt.step()
+    reset_opacity(g.params, opt)
+    assert torch.allclose(torch.sigmoid(g.params["opacities"]),
+                          torch.full((8,), 0.01), atol=1e-6)
+    st = opt.state[g.params["opacities"]]
+    assert float(st["exp_avg"].abs().sum()) == 0 and float(st["exp_avg_sq"].abs().sum()) == 0

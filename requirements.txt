@@ -10,5 +10,6 @@ opencv-python
 imageio
 lpips
 matplotlib
+pandas
 tqdm
 pytest

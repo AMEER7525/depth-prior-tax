@@ -1,8 +1,8 @@
 """Download Depth Anything V2 weights to a directory (Drive, SSD, or local).
 
-Needed only for stage4_real -- the proposal's "one real monocular operating
-point". Axis C runs on perturbed GROUND-TRUTH depth and needs no model at all,
-so this is not on the critical path.
+Needed only for the stage4_real and stage5_dtu_real stages, which use the real
+monocular model. The corruption stages perturb reference depth and need no
+model at all, so this is not on the critical path.
 
     python scripts/fetch_model.py --variant large \
         --dest "/content/drive/MyDrive/models/depth_anything_v2_large"

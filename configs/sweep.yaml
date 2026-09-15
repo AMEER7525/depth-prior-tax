@@ -1,68 +1,160 @@
-# Staged grid. Each stage FIXES the winner of the previous one, per the
-# proposal's "fix the best init from Week 3 before the Week 4 depth-quality
-# grid". A full Cartesian product over all four axes is ~550 runs (~140-275
-# GPU-hours); staged it is ~140 runs (~35-70), which fits weeks 3-5.
+# Staged grid. Each stage FIXES the winner of the previous one: the best
+# initialization is chosen before the depth-quality grid runs. Cells that
+# provably cannot produce an independent result are pruned
+# by src/sweep.py -- preview any stage with
+#     python scripts/run_sweep.py --sweep configs/sweep.yaml --stage <s> --dry-run --explain-pruning
 #
-# Cells that provably cannot produce an independent result are pruned by
-# src/sweep.py -- run with --explain-pruning to see what was dropped.
+# A stage may carry `fixed:` settings shared by all its cells. Run counts are
+# after pruning. At 400x400 / 7k iterations a run took about 1.5-2 min on the
+# L4 and A100 GPUs used; --shard splits a stage across sessions.
 
-# ---- Stage 1: Axis A x B. Which initialization, at which view count? -------
-# No depth loss anywhere, so this isolates initialization. 3*3*3 = 27 runs.
+# ---- Smoke test: one short run per init, to prove the pipeline end to end --
+smoke:
+  fixed: {iterations: 500}
+  axes:
+    init: [random, sfm, depth]
+    n_views: [3]
+    depth_lambda: [0.1]
+  scenes: [lego]
+# 3 runs.
+
+# ---- Stage 0: reproduction check --------------------------------------------
+# Vanilla 3DGS -- random init, SH degree 3 -- on the published 8-view
+# NeRF-Synthetic split (DietNeRF ids), 400x400, white background, 6000
+# iterations: DNGaussian's protocol (CVPR'24, Blender table). Its 3DGS row is
+# PSNR 22.23 / SSIM 0.858 / LPIPS 0.114 over the 8 scenes; the check passes
+# within ~1 dB. The DTU 3-view protocol of the same paper (Table 1: plain 3DGS
+# 10.99 dB) needs the 15 benchmark DTU scans, which the SampleSet used here
+# does not contain.
+#
+# "Vanilla 3DGS stopped at 6000 iterations": vanilla densifies until 15k, so
+# here it densifies for the whole run (densify_until: 1.0), resets opacity at
+# 500 (white background) and 3000, and decays the means lr on vanilla's 30k
+# horizon (means_lr_steps: 30000).
+stage0_repro:
+  fixed: {split: dietnerf, sh_degree: 3, iterations: 6000, densify_until: 1.0,
+          means_lr_steps: 30000}
+  axes:
+    init: [random]
+    n_views: [8]
+    depth_lambda: [0.0]
+  scenes: [chair, drums, ficus, hotdog, lego, materials, mic, ship]
+# 8 runs.
+
+# ---- Stage 1: Axis A x B, no depth loss. Which init, at which view count? ---
 stage1:
   axes:
     init:         [sfm, random, depth]
     n_views:      [3, 5, 9]
     depth_lambda: [0.0]
   scenes: [lego, chair, ship]
+# 27 runs.
 
-# ---- Stage 2: the lambda x loss-kind sweep, at stage1's winning init -------
-# Finds where depth flips from help to harm. 2*3*3*3 = 54 runs.
-stage2:
+# ---- Stage 2a: the other half of Axis A -- every init WITH the depth loss ---
+stage2_init_loss:
   axes:
-    init:         [depth]          # <- set to the stage1 winner
+    init:         [sfm, random, depth]
+    n_views:      [3, 9]
+    depth_kind:   [ssi]
+    depth_lambda: [0.1]
+  scenes: [lego, chair, ship]
+# 18 runs.
+
+# ---- Stage 2b: lambda x loss kind, at stage1's winning init ----------------
+# Finds where depth flips from help to harm.
+stage2_lambda:
+  axes:
+    init:         [depth]            # <- set to the stage1 winner
     n_views:      [3, 9]
     depth_kind:   [ssi, pearson, absolute]
-    depth_lambda: [0.05, 0.1, 0.5]
-  scenes: [lego, chair, ship]
+    depth_lambda: [0.03, 0.1, 0.3, 1.0]
+  scenes: [lego, chair]
+# 48 runs.
 
 # ---- Stage 3: Axis C, the controlled degradation curve ---------------------
-# Two arms swept SEPARATELY, not as a product -- they probe different failure
-# modes and a noise x affine grid buys nothing. Set init/depth_lambda to the
-# stage1/stage2 winners before launching.
-#
-# 3a: additive noise. Every loss can see this one.
+# Three corruption arms, each through three paths into the run:
+#   init-only (init=depth, lambda=0) | loss-only (init=random, lambda>0) | both.
+# Pruning removes the path x loss combinations that are blind to a corruption
+# (e.g. loss-only pearson under affine bias). Set depth_lambda to the stage2
+# winner before launching. Add noise_corr_px to `fixed` for low-frequency noise.
 stage3_noise:
   axes:
-    init:         [depth]
-    n_views:      [3, 9]
+    init:         [depth, random]
+    n_views:      [3]
     depth_kind:   [ssi, absolute]
-    depth_lambda: [0.1]            # <- set to the stage2 winner
+    depth_lambda: [0.0, 0.1]         # <- 0.1: set to the stage2 winner
     sigma_rel:    [0.05, 0.1, 0.2, 0.4]
   scenes: [lego, chair]
+# 40 runs.
 
-# 3b: affine scale bias -- the monocular failure mode. With init=depth the bias
-# reaches geometry through backprojection even when the loss is blind to it,
-# which is exactly the appearance-vs-geometry split the project is hunting.
+# Global affine bias -- one scale for every view. Under- and over-scaled.
 stage3_affine:
   axes:
-    init:         [depth]
-    n_views:      [3, 9]
+    init:         [depth, random]
+    n_views:      [3]
     depth_kind:   [ssi, absolute]
-    depth_lambda: [0.1]            # <- set to the stage2 winner
-    scale:        [1.25, 1.5, 2.0]
-    shift:        [0.0]
+    depth_lambda: [0.0, 0.1]
+    scale:        [0.8, 1.25, 1.5, 2.0]
   scenes: [lego, chair]
+# 32 runs.
+
+# Per-image affine bias -- each view its own scale, the monocular failure mode
+# that also breaks multi-view consistency.
+stage3_perimage:
+  axes:
+    init:         [depth, random]
+    n_views:      [3]
+    depth_kind:   [ssi, absolute]
+    depth_lambda: [0.0, 0.1]
+    scale_jitter: [0.05, 0.1, 0.2, 0.4]
+  scenes: [lego, chair]
+# 32 runs.
 
 # ---- Stage 4: where does a REAL monocular model land on that curve? --------
-# The proposal's "one real operating point". Runs the same cells as stage3 but
-# with a real predictor instead of perturbed GT, so its appearance/geometry
-# result can be plotted against the stage3 degradation curve. No corruption
-# knobs here -- there is no GT to perturb.
+# Same paths as stage3, with Depth Anything V2 instead of perturbed GT. Two
+# alignments: gt = per-image oracle (only the model's non-affine error is
+# left), sfm = against triangulated points (what a practitioner can do). Each
+# run logs prior_absrel, the common x-axis of the stage3 curves.
 stage4_real:
+  fixed: {depth_model: depth_anything_v2}
+  axes:
+    init:         [depth, random]
+    n_views:      [3]
+    depth_align:  [gt, sfm]
+    depth_kind:   [ssi, absolute]
+    depth_lambda: [0.0, 0.1]
+  scenes: [lego, chair]
+# 20 runs.
+
+# ---- Stage 5: DTU realism check (SampleSet scans 1 and 6) ------------------
+# Official DTU Chamfer. Build the data first with scripts/prepare_dtu.py.
+stage5_dtu_base:
+  fixed: {dataset: dtu, downscale: 1, background: black}
+  axes:
+    init:         [sfm, random]
+    n_views:      [3, 9]
+    depth_lambda: [0.0]
+  scenes: [scan1, scan6]
+# 8 runs.
+
+stage5_dtu_real:
+  fixed: {dataset: dtu, downscale: 1, background: black,
+          depth_model: depth_anything_v2, depth_align: sfm}
+  axes:
+    init:         [depth, sfm, random]
+    n_views:      [3, 9]
+    depth_kind:   [ssi]
+    depth_lambda: [0.0, 0.1]
+  scenes: [scan1, scan6]
+# 16 runs.
+
+# Oracle depth on real images: GT depth z-buffered from the STL scan.
+stage5_dtu_oracle:
+  fixed: {dataset: dtu, downscale: 1, background: black}
   axes:
     init:         [depth]
     n_views:      [3, 9]
-    depth_kind:   [ssi, absolute]
-    depth_lambda: [0.1]            # <- match stage3
-    depth_model:  [depth_anything_v2]
-  scenes: [lego, chair]
+    depth_kind:   [ssi]
+    depth_lambda: [0.0, 0.1]
+  scenes: [scan1, scan6]
+# 8 runs.

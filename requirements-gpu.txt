@@ -1,12 +1,12 @@
 # GPU-only dependencies. NOT installable on Apple Silicon -- gsplat compiles
-# CUDA kernels. Install on the 4080 box and on Colab only.
+# CUDA kernels. Install only on a machine with an NVIDIA GPU (e.g. Colab).
 -r requirements.txt
 
 # The rasterizer. render_mode="RGB+ED" gives expected (opacity-normalized)
 # depth as the last channel, which is what the depth loss supervises.
 gsplat
 
-# Depth Anything V2 for the real-monocular-model operating point (week 5).
+# Depth Anything V2, the real monocular depth model.
 # Runs on MPS too, so depth maps can be precomputed on the Mac.
 timm
 transformers

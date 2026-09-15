@@ -1,7 +1,7 @@
 [project]
-name = "final-project"
+name = "depth-prior-3dgs"
 version = "0.1.0"
-description = "Add your description here"
+description = "When do monocular-depth priors trade appearance for geometry in sparse-view 3D Gaussian Splatting?"
 readme = "README.md"
 requires-python = ">=3.12"
 dependencies = []

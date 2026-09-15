@@ -14,6 +14,13 @@ import torch
 # should supervise, because it accounts for transmittance.
 RENDER_MODE = "RGB+ED"
 
+# Must match what the densification strategy is told in step_post_backward.
+# gsplat's rasterization() defaults to packed=True while DefaultStrategy
+# defaults to packed=False; leaving both at their defaults makes the strategy
+# read packed [nnz] tensors as if they were [C, N], and densification silently
+# accumulates gradients onto the wrong Gaussians. Pinned here, used by both.
+PACKED = False
+
 
 def _rasterization():
     """Imported lazily so this module can be imported on a machine without CUDA."""
@@ -39,8 +46,12 @@ def viewmats_from_c2w(c2w):
     return w2c
 
 
-def render(gaussians, views, device, rasterize=None, background=0.0):
+def render(gaussians, views, device, rasterize=None, background=0.0, sh_degree=None):
     """Render a batch of views.
+
+    Colour goes through gsplat's spherical-harmonics path exactly as in
+    vanilla 3DGS; `sh_degree` is the degree active at this step (3DGS raises
+    it progressively), defaulting to the cloud's maximum.
 
     Returns (rgb, depth, alpha, info):
         rgb   (C, H, W, 3)   composited over `background`
@@ -50,6 +61,8 @@ def render(gaussians, views, device, rasterize=None, background=0.0):
     """
     rasterize = rasterize or _rasterization()
     a = gaussians.activated
+    if sh_degree is None:
+        sh_degree = gaussians.sh_degree
 
     viewmats = torch.stack([viewmats_from_c2w(v.c2w)[0] for v in views]).to(device)
     Ks = torch.stack([torch.as_tensor(v.K, dtype=torch.float32) for v in views]).to(device)
@@ -57,14 +70,15 @@ def render(gaussians, views, device, rasterize=None, background=0.0):
 
     out, alphas, info = rasterize(
         means=a["means"], quats=a["quats"], scales=a["scales"],
-        opacities=a["opacities"], colors=a["colors"],
+        opacities=a["opacities"], colors=a["sh"],
         viewmats=viewmats, Ks=Ks, width=W, height=H,
-        render_mode=RENDER_MODE, sh_degree=None,
+        render_mode=RENDER_MODE, sh_degree=sh_degree, packed=PACKED,
     )
     rgb, depth = out[..., :3], out[..., 3]
-    # NeRF-Synthetic is evaluated composited on a fixed background; the
-    # rasterizer returns premultiplied colour, so add the uncovered part back.
-    rgb = rgb + (1.0 - alphas) * background
+    # The rasterizer returns premultiplied colour, so add the uncovered part of
+    # the background back. NeRF-Synthetic is evaluated on a fixed background.
+    bg = torch.as_tensor(background, dtype=rgb.dtype, device=rgb.device)
+    rgb = rgb + (1.0 - alphas) * bg
     return rgb, depth, alphas, info
 
 

@@ -10,6 +10,7 @@ from __future__ import annotations
 import argparse
 import json
 import os
+import shutil
 import subprocess
 import sys
 from pathlib import Path
@@ -38,6 +39,10 @@ def parse_args():
                    help="skip runs whose output dir already holds metrics.json")
     p.add_argument("--shard", default=None, metavar="i/n",
                    help="run only shard i of n, to split a stage across sessions/hosts")
+    p.add_argument("--mirror", default=os.environ.get("RUNS_MIRROR"),
+                   help="copy every run here as soon as it ends (Drive on Colab), "
+                        "and treat runs finished there as done under --resume "
+                        "(default $RUNS_MIRROR)")
     return p.parse_args()
 
 
@@ -46,7 +51,40 @@ def runs_root(arg):
 
 
 def is_finished(run_dir):
-    return (run_dir / "metrics.json").exists()
+    """Done = a metrics.json from a run trained with the opacity-reset fix.
+
+    Runs trained before train.py took over the reset that gsplat 1.5.3 never
+    performs carry no `opacity_resets` record; --resume re-runs them rather
+    than skipping them forever.
+    """
+    m = run_dir / "metrics.json"
+    if not m.exists():
+        return False
+    try:
+        return "opacity_resets" in json.loads(m.read_text())
+    except (json.JSONDecodeError, OSError):
+        return False
+
+
+def missing_inputs(cfg, data_root):
+    """What a run of `cfg` needs on local disk that is not there, as hints."""
+    root = Path(data_root)
+    if cfg.get("dataset", "blender") == "dtu":
+        from src.data import parse_scan_id
+        cams = root / "dtu" / f"scan{parse_scan_id(cfg['scene'])}" / "cameras.npz"
+        return [] if cams.exists() else [
+            f"DTU {cfg['scene']} -- run cell 7 with PREPARE_DTU ticked"]
+    scene_dir = root / "nerf_synthetic" / str(cfg["scene"])
+    if not (scene_dir / "transforms_train.json").exists():
+        return [f"NeRF-Synthetic {cfg['scene']} -- run cell 4 (for stage0_repro, "
+                "tick ALL_8_FOR_STAGE0 first)"]
+    d, loss = cfg.get("depth") or {}, cfg.get("loss") or {}
+    uses_depth = cfg.get("init") == "depth" or loss.get("depth_lambda", 0.0) > 0
+    needs_reference = uses_depth and (d.get("model", "gt") == "gt"
+                                      or d.get("align", "gt") == "gt")
+    if needs_reference and not any((scene_dir / "depth_train").glob("*.npy")):
+        return [f"reference depth for {cfg['scene']} -- run cell 5"]
+    return []
 
 
 def main():
@@ -78,8 +116,24 @@ def main():
         for reason, group in sorted(by_reason.items(), key=lambda kv: -len(kv[1])):
             print(f"  {len(group):4d}  {reason}")
 
-    pending = [c for c in cells
-               if not (args.resume and is_finished(root / args.stage / run_id(c)))]
+    mirror = Path(args.mirror) if args.mirror else None
+
+    def done(c):
+        rid = run_id(c)
+        return (is_finished(root / args.stage / rid)
+                or (mirror is not None and is_finished(mirror / args.stage / rid)))
+
+    pending = [c for c in cells if not (args.resume and done(c))]
+
+    # Refuse to start rather than record a FAILED run per missing scene: a
+    # missing input is a setup step, not a result.
+    if not args.dry_run:
+        data_root = os.environ.get("DATA_ROOT", "data")
+        missing = sorted({m for c in pending
+                          for m in missing_inputs(_apply_cell(base_cfg, c), data_root)})
+        if missing:
+            sys.exit(f"[{args.stage}] not started -- missing under DATA_ROOT={data_root}:\n  "
+                     + "\n  ".join(missing) + "\nNothing was run.")
     skipped = len(cells) - len(pending)
     if skipped:
         print(f"resume: skipping {skipped} finished run(s)")
@@ -96,6 +150,8 @@ def main():
             continue
 
         out.mkdir(parents=True, exist_ok=True)
+        for stale in ("FAILED", "error.txt"):       # from an earlier attempt
+            (out / stale).unlink(missing_ok=True)
         cfg_path = out / "config.yaml"
         with open(cfg_path, "w") as f:
             yaml.safe_dump(cfg, f, sort_keys=False)
@@ -110,6 +166,13 @@ def main():
             # One bad scene must not abandon a 200-run grid; record and continue.
             (out / "FAILED").write_text(f"exit {result.returncode}\n")
             print(f"  !! failed (exit {result.returncode}), continuing")
+        if mirror is not None:
+            # Colab reclaims /content without warning; a run is only safe once
+            # it is on Drive, so copy each one the moment it ends.
+            dest = mirror / args.stage / rid
+            if dest.exists():
+                shutil.rmtree(dest)
+            shutil.copytree(out, dest)
         launched += 1
 
 
@@ -122,10 +185,13 @@ def _check_corruption_reachable(cfg, cell, rid):
     ignored -- and the whole degradation curve comes out flat for a reason that
     has nothing to do with the hypothesis. Fail loudly instead.
     """
-    corrupting = (cell.get("sigma_rel", 0.0) != 0.0
-                  or cell.get("scale", 1.0) != 1.0
-                  or cell.get("shift", 0.0) != 0.0)
-    model = cfg.get("depth", {}).get("model")
+    d = cfg.get("depth", {})
+    corrupting = (d.get("sigma_rel", 0.0) != 0.0
+                  or d.get("scale", 1.0) != 1.0
+                  or d.get("shift", 0.0) != 0.0
+                  or d.get("scale_jitter", 0.0) != 0.0
+                  or d.get("shift_jitter", 0.0) != 0.0)
+    model = d.get("model")
     if corrupting and model != "gt":
         sys.exit(
             f"\n{rid}\n"
@@ -140,15 +206,29 @@ def _apply_cell(base_cfg, cell):
     import copy
     cfg = copy.deepcopy(base_cfg)
     routes = {
-        "init": ("init",),
+        "dataset": ("dataset",),
         "scene": ("scene",),
         "n_views": ("n_views",),
+        "split": ("split",),
+        "downscale": ("downscale",),
+        "background": ("background",),
+        "eval_views": ("eval_views",),
+        "init": ("init",),
         "depth_kind": ("loss", "depth_kind"),
         "depth_lambda": ("loss", "depth_lambda"),
         "sigma_rel": ("depth", "sigma_rel"),
+        "noise_corr_px": ("depth", "noise_corr_px"),
         "scale": ("depth", "scale"),
         "shift": ("depth", "shift"),
+        "scale_jitter": ("depth", "scale_jitter"),
+        "shift_jitter": ("depth", "shift_jitter"),
         "depth_model": ("depth", "model"),
+        "depth_align": ("depth", "align"),
+        "iterations": ("train", "iterations"),
+        "densify_until": ("train", "densify_until"),
+        "means_lr_steps": ("train", "means_lr_steps"),
+        "sh_degree": ("train", "sh_degree"),
+        "seed": ("train", "seed"),
     }
     for key, value in cell.items():
         if key.startswith("_") or value is None:
